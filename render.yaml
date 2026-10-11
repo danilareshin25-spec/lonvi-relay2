@@ -1,0 +1,12 @@
+# Render Blueprint: один бесплатный веб-сервис с посредником LonviSound
+services:
+  - type: web
+    name: lonvi-relay2
+    runtime: node
+    plan: free
+    buildCommand: npm install
+    startCommand: node server.mjs
+    healthCheckPath: /health
+    envVars:
+      - key: LONVI_KEY
+        sync: false
