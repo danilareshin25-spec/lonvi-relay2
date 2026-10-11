@@ -3,6 +3,7 @@
 // Без зависимостей, нужен Node.js 18+. Запуск: LONVI_KEY=секрет node server.mjs
 import http from 'node:http'
 import { Readable } from 'node:stream'
+import zlib from 'node:zlib'
 
 const PORT = Number(process.env.PORT || 8787)
 const KEY = process.env.LONVI_KEY || ''
@@ -40,11 +41,36 @@ function rewritePlaylist(req, text, base) {
     .join('\n')
 }
 
+// Учёт: сколько отдано и кто заходил (последние запросы — без полных IP)
+const stats = { since: new Date().toISOString(), requests: 0, bytes: 0, byHost: {}, recent: [] }
+const count = (req, host, status, bytes) => {
+  stats.requests++
+  stats.bytes += bytes
+  stats.byHost[host] = (stats.byHost[host] || 0) + bytes
+  const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim()
+  const country = req.headers['cf-ipcountry'] || req.headers['x-country'] || ''
+  stats.recent.unshift({ t: new Date().toISOString(), ip: ip.split(/[.:]/).slice(0, 2).join('.') + '.*', country, host, status, bytes })
+  stats.recent.length = Math.min(stats.recent.length, 60)
+}
+// Сообщения от приложения (что у пользователя работает, а что нет)
+const reports = []
+
 const server = http.createServer(async (req, res) => {
   try {
     const u = new URL(req.url, 'http://x')
     if (req.method === 'OPTIONS') return res.writeHead(204, cors).end()
     if (u.pathname === '/health') return res.writeHead(200, { ...cors, 'Content-Type': 'text/plain' }).end('ok')
+    if (u.pathname === '/stats') {
+      if (u.searchParams.get('k') !== KEY) return res.writeHead(403, cors).end('bad key')
+      return res.writeHead(200, { ...cors, 'Content-Type': 'application/json' }).end(JSON.stringify({ ...stats, reports }, null, 1))
+    }
+    if (u.pathname === '/report') {
+      if (u.searchParams.get('k') !== KEY) return res.writeHead(403, cors).end('bad key')
+      const ip = String(req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim()
+      reports.unshift({ t: new Date().toISOString(), ip: ip.split(/[.:]/).slice(0, 2).join('.') + '.*', m: String(u.searchParams.get('m') || '').slice(0, 600) })
+      reports.length = Math.min(reports.length, 40)
+      return res.writeHead(204, cors).end()
+    }
     if (u.pathname !== '/r') return res.writeHead(404, cors).end()
     if (u.searchParams.get('k') !== KEY) return res.writeHead(403, cors).end('bad key')
 
@@ -60,7 +86,11 @@ const server = http.createServer(async (req, res) => {
     const type = r.headers.get('content-type') || ''
     if (/mpegurl/i.test(type) || target.pathname.endsWith('.m3u8')) {
       const body = rewritePlaylist(req, await r.text(), r.url)
-      return res.writeHead(r.status, { ...cors, 'Content-Type': type || 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-store' }).end(body)
+      return sendText(req, res, r.status, { ...cors, 'Content-Type': type || 'application/vnd.apple.mpegurl', 'Cache-Control': 'no-store' }, body, target.hostname)
+    }
+    // JSON, страницы, тексты песен — сжимаем (в 5–10 раз меньше трафика)
+    if (/json|text|javascript|xml/i.test(type) && !req.headers.range) {
+      return sendText(req, res, r.status, { ...cors, 'Content-Type': type }, Buffer.from(await r.arrayBuffer()), target.hostname)
     }
     const out = { ...cors, 'Content-Type': type || 'application/octet-stream' }
     for (const h of ['content-length', 'content-range', 'accept-ranges', 'cache-control', 'etag', 'last-modified']) {
@@ -69,11 +99,26 @@ const server = http.createServer(async (req, res) => {
     }
     res.writeHead(r.status, out)
     if (!r.body) return res.end()
-    Readable.fromWeb(r.body).on('error', () => res.destroy()).pipe(res)
+    let sent = 0
+    const stream = Readable.fromWeb(r.body)
+    stream.on('data', (c) => (sent += c.length))
+    stream.on('end', () => count(req, target.hostname, r.status, sent))
+    stream.on('error', () => res.destroy()).pipe(res)
   } catch (e) {
     if (!res.headersSent) res.writeHead(502, cors)
     res.end(String(e?.message || e))
   }
 })
+
+function sendText(req, res, status, headers, body, host) {
+  const buf = Buffer.isBuffer(body) ? body : Buffer.from(body)
+  if (/gzip/.test(req.headers['accept-encoding'] || '') && buf.length > 1024) {
+    const z = zlib.gzipSync(buf, { level: 6 })
+    count(req, host, status, z.length)
+    return res.writeHead(status, { ...headers, 'Content-Encoding': 'gzip', 'Content-Length': z.length, Vary: 'Accept-Encoding' }).end(z)
+  }
+  count(req, host, status, buf.length)
+  return res.writeHead(status, { ...headers, 'Content-Length': buf.length }).end(buf)
+}
 
 server.listen(PORT, () => console.log(`LonviSound relay: http://0.0.0.0:${PORT}`))
